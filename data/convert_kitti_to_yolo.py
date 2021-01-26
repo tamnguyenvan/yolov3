@@ -14,7 +14,7 @@ KITTI_NAMES = [
 ]
 
 
-def load_txt(text_file):
+def load_txt(text_file, img_width, img_height):
     """
     """
     all_data = []
@@ -58,9 +58,10 @@ def main():
     # Split
     val_split = 0.1
     test_split = 0.1
-    num_val = int(len(img_paths) * (1 - val_split))
-    num_test = int(len(img_paths) * (1 - test_split))
+    num_val = int(len(img_paths) * val_split)
+    num_test = int(len(img_paths) * test_split)
     num_train = len(img_paths) - num_val - num_test
+    print(num_val, num_test, num_train)
     np.random.seed(42)
     indices = np.arange(len(img_paths))
     np.random.shuffle(indices)
@@ -77,6 +78,10 @@ def main():
     test_img_paths = img_paths[num_train+num_val:]
     test_label_paths = label_paths[num_train+num_val:]
 
+    print('Number of training: {}'.format(len(train_img_paths)))
+    print('Number of validation: {}'.format(len(val_img_paths)))
+    print('Number of test: {}'.format(len(test_img_paths)))
+
     # Prepare outputs
     out_dir = args.result_dir
     os.makedirs(out_dir, exist_ok=True)
@@ -91,28 +96,33 @@ def main():
     sources = {
         'train': (train_img_paths, train_label_paths),
         'val': (val_img_paths, val_label_paths),
-        'tet': (test_img_paths, test_label_paths)
+        'test': (test_img_paths, test_label_paths)
     }
     class_map = {class_name: idx for idx, class_name in enumerate(KITTI_NAMES)}
     for split, data_source in sources.items():
+        print('Creating {}'.format(split))
         split_img_dir = os.path.join(image_dir, split)
         split_label_dir = os.path.join(label_dir, split)
         os.makedirs(split_img_dir, exist_ok=True)
         os.makedirs(split_label_dir, exist_ok=True)
-        for img_path, label_path in data_source:
+        for img_path, label_path in tqdm.tqdm(zip(*data_source)):
             img_filename = os.path.basename(img_path)
             dst_img_path = os.path.join(split_img_dir, img_filename)
             shutil.copy(img_path, dst_img_path)
 
+            img = cv2.imread(img_path)
+            h, w = img.shape[:2]
+
             label_filename = os.path.basename(label_path)
             dst_label_path = os.path.join(split_label_dir, label_filename)
-            label_data = load_txt(dst_label_path)
+            label_all_data = load_txt(label_path, w, h)
             with open(dst_label_path, 'wt') as f:
-                class_name = label_data[0]
-                bbox_data = label_data[1:]
-                class_id = class_map[class_name]
-                for bbox in bbox_data:
-                    dump_data = [class_id, *bbox]
+                for label_data in label_all_data:
+                    class_name = label_data[0]
+                    bbox_data = label_data[1:]
+                    class_id = class_map[class_name]
+                    # print(class_id, bbox_data)
+                    dump_data = [class_id, *bbox_data]
                     f.write(' '.join(map(str, dump_data)) + '\n')
 
 
