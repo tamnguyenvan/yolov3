@@ -257,7 +257,7 @@ def plot_study_txt(path='study/', x=None):  # from utils.plots import *; plot_st
 def plot_labels(labels, save_dir=Path(''), loggers=None):
     # plot dataset labels
     print('Plotting labels... ')
-    c, b = labels[:, 0], labels[:, 1:].transpose()  # classes, boxes
+    c, b = labels[:, 0], labels[:, 1:5].transpose()  # classes, boxes
     nc = int(c.max() + 1)  # number of classes
     colors = color_list()
     x = pd.DataFrame(b.transpose(), columns=['x', 'y', 'width', 'height'])
@@ -277,9 +277,9 @@ def plot_labels(labels, save_dir=Path(''), loggers=None):
 
     # rectangles
     labels[:, 1:3] = 0.5  # center
-    labels[:, 1:] = xywh2xyxy(labels[:, 1:]) * 2000
+    labels[:, 1:5] = xywh2xyxy(labels[:, 1:5]) * 2000
     img = Image.fromarray(np.ones((2000, 2000, 3), dtype=np.uint8) * 255)
-    for cls, *box in labels[:1000]:
+    for cls, *box in labels[:1000, :5]:
         ImageDraw.Draw(img).rectangle(box, width=1, outline=colors[int(cls) % 10])  # plot
     ax[1].imshow(img)
     ax[1].axis('off')

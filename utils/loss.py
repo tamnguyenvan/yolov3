@@ -85,18 +85,35 @@ class QFocalLoss(nn.Module):
             return loss
 
 
+def orientation_loss(y_true, y_pred):
+    # Find number of anchors
+    anchors = torch.sum(torch.square(y_true), 2)
+    anchors = anchors > 0.5
+    anchors = torch.sum(anchors.float(), 1)
+
+    # Define the loss
+    loss = (y_true[:,:,0]*y_pred[:,:,0] + y_true[:,:,1]*y_pred[:,:,1])
+    loss = torch.sum((2 - 2 * torch.mean(loss, 0))) / anchors
+
+    return torch.mean(loss)
+
+
 def compute_loss(p, targets, model):  # predictions, targets, model
     device = targets.device
     lcls, lbox, lobj = torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device)
-    tcls, tbox, indices, anchors = build_targets(p, targets, model)  # targets
+    ldim, lorient, lconf = torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device)
+    tcls, tbox, tdims, torient, tconf, indices, anchors = build_targets(p, targets, model)  # targets
     h = model.hyp  # hyperparameters
 
     # Define criteria
     BCEcls = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([h['cls_pw']], device=device))  # weight=model.class_weights)
     BCEobj = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([h['obj_pw']], device=device))
+    MSEobj = nn.MSELoss()
 
     # Class label smoothing https://arxiv.org/pdf/1902.04103.pdf eqn 3
     cp, cn = smooth_BCE(eps=0.0)
+
+    nc = model.nc
 
     # Focal loss
     g = h['fl_gamma']  # focal loss gamma
@@ -125,9 +142,14 @@ def compute_loss(p, targets, model):  # predictions, targets, model
 
             # Classification
             if model.nc > 1:  # cls loss (only if multiple classes)
-                t = torch.full_like(ps[:, 5:], cn, device=device)  # targets
+                t = torch.full_like(ps[:, 5:5+nc], cn, device=device)  # targets
                 t[range(n), tcls[i]] = cp
-                lcls += BCEcls(ps[:, 5:], t)  # BCE
+                lcls += BCEcls(ps[:, 5:5+nc], t)  # BCE
+            
+            # Additional 3D loss
+            ldim += MSEobj(ps[:, 5+nc:5+nc+3], tdims[i])  # loss dimension
+            lorient += orientation_loss(torient[i].view(-1, 2, 2), ps[:, 5+nc+3:5+nc+3+4].view(-1, 2, 2))
+            lconf += BCEobj(ps[:, 5+nc+3+4:], tconf[i])
 
             # Append targets to text file
             # with open('targets.txt', 'a') as file:
@@ -140,16 +162,16 @@ def compute_loss(p, targets, model):  # predictions, targets, model
     lcls *= h['cls']
     bs = tobj.shape[0]  # batch size
 
-    loss = lbox + lobj + lcls
-    return loss * bs, torch.cat((lbox, lobj, lcls, loss)).detach()
+    loss = lbox + lobj + lcls + 1.*ldim+ 1.*lorient + 1.*lconf
+    return loss * bs, torch.cat((lbox, lobj, lcls, loss, ldim, lorient, lconf)).detach()
 
 
 def build_targets(p, targets, model):
     # Build targets for compute_loss(), input targets(image,class,x,y,w,h)
     det = model.module.model[-1] if is_parallel(model) else model.model[-1]  # Detect() module
     na, nt = det.na, targets.shape[0]  # number of anchors, targets
-    tcls, tbox, indices, anch = [], [], [], []
-    gain = torch.ones(7, device=targets.device)  # normalized to gridspace gain
+    tcls, tbox, tdims, torient, tconf, indices, anch = [], [], [], [], [], [], []
+    gain = torch.ones(7+9, device=targets.device)  # normalized to gridspace gain
     ai = torch.arange(na, device=targets.device).float().view(na, 1).repeat(1, nt)  # same as .repeat_interleave(nt)
     targets = torch.cat((targets.repeat(na, 1, 1), ai[:, :, None]), 2)  # append anchor indices
 
@@ -188,6 +210,9 @@ def build_targets(p, targets, model):
         b, c = t[:, :2].long().T  # image, class
         gxy = t[:, 2:4]  # grid xy
         gwh = t[:, 4:6]  # grid wh
+        gdims = t[:, 6:9]
+        gorient = t[:, 9:13]
+        gconf = t[:, 13:15]
         gij = (gxy - offsets).long()
         gi, gj = gij.T  # grid xy indices
 
@@ -195,7 +220,10 @@ def build_targets(p, targets, model):
         a = t[:, 6].long()  # anchor indices
         indices.append((b, a, gj.clamp_(0, gain[3] - 1), gi.clamp_(0, gain[2] - 1)))  # image, anchor, grid indices
         tbox.append(torch.cat((gxy - gij, gwh), 1))  # box
+        tdims.append(gdims)
+        torient.append(gorient)
+        tconf.append(gconf)
         anch.append(anchors[a])  # anchors
         tcls.append(c)  # class
 
-    return tcls, tbox, indices, anch
+    return tcls, tbox, tdims, torient, tconf, indices, anch
