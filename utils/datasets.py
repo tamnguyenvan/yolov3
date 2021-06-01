@@ -345,6 +345,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         self.mosaic = self.augment and not self.rect  # load 4 images at a time into a mosaic (only during training)
         self.mosaic_border = [-img_size // 2, -img_size // 2]
         self.stride = stride
+        self.path = path
 
         try:
             f = []  # image files
@@ -352,37 +353,42 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 p = Path(p)  # os-agnostic
                 if p.is_dir():  # dir
                     f += glob.glob(str(p / '**' / '*.*'), recursive=True)
+                    # f = list(p.rglob('**/*.*'))  # pathlib
                 elif p.is_file():  # file
                     with open(p, 'r') as t:
                         t = t.read().strip().splitlines()
                         parent = str(p.parent) + os.sep
                         f += [x.replace('./', parent) if x.startswith('./') else x for x in t]  # local to global path
+                        # f += [p.parent / x.lstrip(os.sep) for x in t]  # local to global path (pathlib)
                 else:
                     raise Exception(f'{prefix}{p} does not exist')
             self.img_files = sorted([x.replace('/', os.sep) for x in f if x.split('.')[-1].lower() in img_formats])
+            # self.img_files = sorted([x for x in f if x.suffix[1:].lower() in img_formats])  # pathlib
             assert self.img_files, f'{prefix}No images found'
         except Exception as e:
             raise Exception(f'{prefix}Error loading data from {path}: {e}\nSee {help_url}')
 
         # Check cache
         self.label_files = img2label_paths(self.img_files)  # labels
-        cache_path = Path(self.label_files[0]).parent.with_suffix('.cache')  # cached labels
+        cache_path = (p if p.is_file() else Path(self.label_files[0]).parent).with_suffix('.cache')  # cached labels
         if cache_path.is_file():
-            cache = torch.load(cache_path)  # load
-            if cache['hash'] != get_hash(self.label_files + self.img_files) or 'results' not in cache:  # changed
-                cache = self.cache_labels(cache_path, prefix)  # re-cache
+            cache, exists = torch.load(cache_path), True  # load
+            if cache['hash'] != get_hash(self.label_files + self.img_files):  # changed
+                cache, exists = self.cache_labels(cache_path, prefix), False  # re-cache
         else:
-            cache = self.cache_labels(cache_path, prefix)  # cache
+            cache, exists = self.cache_labels(cache_path, prefix), False  # cache
 
         # Display cache
-        [nf, nm, ne, nc, n] = cache.pop('results')  # found, missing, empty, corrupted, total
-        desc = f"Scanning '{cache_path}' for images and labels... {nf} found, {nm} missing, {ne} empty, {nc} corrupted"
-        tqdm(None, desc=prefix + desc, total=n, initial=n)
+        nf, nm, ne, nc, n = cache.pop('results')  # found, missing, empty, corrupted, total
+        if exists:
+            d = f"Scanning '{cache_path}' images and labels... {nf} found, {nm} missing, {ne} empty, {nc} corrupted"
+            tqdm(None, desc=prefix + d, total=n, initial=n)  # display cache results
         assert nf > 0 or not augment, f'{prefix}No labels in {cache_path}. Can not train without labels. See {help_url}'
 
         # Read cache
         cache.pop('hash')  # remove hash
-        labels, shapes = zip(*cache.values())
+        cache.pop('version')  # remove version
+        labels, shapes, self.segments = zip(*cache.values())
         self.labels = list(labels)
         self.shapes = np.array(shapes, dtype=np.float64)
         self.img_files = list(cache.keys())  # update
@@ -433,6 +439,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 self.imgs[i], self.img_hw0[i], self.img_hw[i] = x  # img, hw_original, hw_resized = load_image(self, i)
                 gb += self.imgs[i].nbytes
                 pbar.desc = f'{prefix}Caching images ({gb / 1E9:.1f}GB)'
+            pbar.close()
 
     def cache_labels(self, path=Path('./labels.cache'), prefix=''):
         # Cache dataset labels, check images and read shapes
@@ -445,17 +452,24 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 im = Image.open(im_file)
                 im.verify()  # PIL verify
                 shape = exif_size(im)  # image size
-                assert (shape[0] > 9) & (shape[1] > 9), 'image size <10 pixels'
+                segments = []  # instance segments
+                assert (shape[0] > 9) & (shape[1] > 9), f'image size {shape} <10 pixels'
+                assert im.format.lower() in img_formats, f'invalid image format {im.format}'
 
                 # verify labels
                 if os.path.isfile(lb_file):
                     nf += 1  # label found
                     with open(lb_file, 'r') as f:
-                        l = np.array([x.split() for x in f.read().strip().splitlines()], dtype=np.float32)  # labels
+                        l = [x.split() for x in f.read().strip().splitlines() if len(x)]
+                        if any([len(x) > 8 for x in l]):  # is segment
+                            classes = np.array([x[0] for x in l], dtype=np.float32)
+                            segments = [np.array(x[1:], dtype=np.float32).reshape(-1, 2) for x in l]  # (cls, xy1...)
+                            l = np.concatenate((classes.reshape(-1, 1), segments2boxes(segments)), 1)  # (cls, xywh)
+                        l = np.array(l, dtype=np.float32)
                     if len(l):
-                        assert l.shape[1] == 5+9, 'labels require 5+9 columns each'
-                        # assert (l >= 0).all(), 'negative labels'
-                        # assert (l[:, 1:] <= 1).all(), 'non-normalized or out of bounds coordinate labels'
+                        assert l.shape[1] == 5, 'labels require 5 columns each'
+                        assert (l >= 0).all(), 'negative labels'
+                        assert (l[:, 1:] <= 1).all(), 'non-normalized or out of bounds coordinate labels'
                         assert np.unique(l, axis=0).shape[0] == l.shape[0], 'duplicate labels'
                     else:
                         ne += 1  # label empty
@@ -463,21 +477,26 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 else:
                     nm += 1  # label missing
                     l = np.zeros((0, 5), dtype=np.float32)
-                x[im_file] = [l, shape]
+                x[im_file] = [l, shape, segments]
             except Exception as e:
                 nc += 1
-                print(f'{prefix}WARNING: Ignoring corrupted image and/or label {im_file}: {e}')
+                logging.info(f'{prefix}WARNING: Ignoring corrupted image and/or label {im_file}: {e}')
 
-            pbar.desc = f"{prefix}Scanning '{path.parent / path.stem}' for images and labels... " \
+            pbar.desc = f"{prefix}Scanning '{path.parent / path.stem}' images and labels... " \
                         f"{nf} found, {nm} missing, {ne} empty, {nc} corrupted"
+        pbar.close()
 
         if nf == 0:
-            print(f'{prefix}WARNING: No labels found in {path}. See {help_url}')
+            logging.info(f'{prefix}WARNING: No labels found in {path}. See {help_url}')
 
         x['hash'] = get_hash(self.label_files + self.img_files)
-        x['results'] = [nf, nm, ne, nc, i + 1]
-        torch.save(x, path)  # save for next time
-        logging.info(f'{prefix}New cache created: {path}')
+        x['results'] = nf, nm, ne, nc, i + 1
+        x['version'] = 0.2  # cache version
+        try:
+            torch.save(x, path)  # save cache for next time
+            logging.info(f'{prefix}New cache created: {path}')
+        except Exception as e:
+            logging.info(f'{prefix}WARNING: Cache directory {path.parent} is not writeable: {e}')  # path not writeable
         return x
 
     def __len__(self):
@@ -515,16 +534,9 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
             shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
 
-            # Load labels
-            labels = []
-            x = self.labels[index]
-            if x.size > 0:
-                # Normalized xywh to pixel xyxy format
-                labels = x.copy()
-                labels[:, 1] = ratio[0] * w * (x[:, 1] - x[:, 3] / 2) + pad[0]  # pad width
-                labels[:, 2] = ratio[1] * h * (x[:, 2] - x[:, 4] / 2) + pad[1]  # pad height
-                labels[:, 3] = ratio[0] * w * (x[:, 1] + x[:, 3] / 2) + pad[0]
-                labels[:, 4] = ratio[1] * h * (x[:, 2] + x[:, 4] / 2) + pad[1]
+            labels = self.labels[index].copy()
+            if labels.size:  # normalized xywh to pixel xyxy format
+                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
 
         if self.augment:
             # Augment imagespace
@@ -562,7 +574,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 if nL:
                     labels[:, 1] = 1 - labels[:, 1]
 
-        labels_out = torch.zeros((nL, 6+9))
+        labels_out = torch.zeros((nL, 6))
         if nL:
             labels_out[:, 1:] = torch.from_numpy(labels)
 
